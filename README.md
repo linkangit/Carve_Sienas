@@ -1,6 +1,6 @@
 # Calling SIENAs from differential H3K9ac domains
 
-**SIENA** = *Stimulus-Induced ENhancer-locus Annotation*: an intergenic
+**SIENA** = *Stimulus-Induced Enhancer Acetylation*: an intergenic
 sub-interval of a ChIP domain that gains a histone mark on stimulation. This
 repository contains `carve_sienas.py`, a small, dependency-light tool that
 defines sienas directly from a set of differential ChIP domains and a gene
