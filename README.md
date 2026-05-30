@@ -18,7 +18,6 @@ in the tool is species- or mark-specific.
 | `carve_sienas.py` | The tool |
 | `run_example.sh` | One-command reproduction of the worked set |
 | `requirements.txt` | Python dependencies |
-| `LICENSE` | MIT (add your name) |
 
 ---
 
