@@ -13,7 +13,13 @@ inside a gene body yields none. Boundaries use the NEAR EDGE of each gene body
 resumes at gene_end+1).
 
 Each siena inherits its parent domain's statistics (log2FoldChange, FDR, ...),
-so the "stimulus-induced" status of the domain carries through.
+so the "stimulus-induced" status of the domain carries through. Each siena is
+also labelled with a `domain_class`:
+    gene_free    parent domain spans 0 genes (fully intergenic domain)
+    single_gene  parent domain spans exactly 1 gene
+    multi_gene   parent domain spans 2+ genes
+single_gene and multi_gene sienas are, by construction, adjacent to a gene body
+that lies inside an induced domain (i.e. "near an induced gene body").
 
 Inputs
 ------
@@ -26,8 +32,10 @@ Inputs
 
 Outputs
 -------
---out-csv   Full siena table (CSV).
---out-bed   Optional BED6 (0-based, half-open) for browsers / bedtools.
+--out-csv      Full siena table (CSV), incl. domain_class.
+--out-bed      Optional siena BED6 (0-based, half-open) for browsers/bedtools.
+--out-genebed  Optional gene-body BED6: full spans of the genes inside
+               single_gene + multi_gene domains that yield a qualifying siena.
 
 Example
 -------
@@ -36,9 +44,10 @@ python3 carve_sienas.py \
     --domains  H3K9ac_tomato_2h_vs_ctrl.csv \
     --domain-chrom '#Chromosome' --domain-start Start --domain-end End \
     --carry log2FoldChange FDR PValue Score ChIPCount InputCount \
-    --out-csv  sienas_from_domains.csv \
-    --out-bed  sienas_from_domains.bed \
-    --min-len  0
+    --min-log2fc 1.0 --min-len 1000 \
+    --out-csv      sienas_classified.csv \
+    --out-bed      sienas.bed \
+    --out-genebed  gene_bodies.bed
 """
 
 import argparse
@@ -97,19 +106,26 @@ def build_gene_bodies(gtf_path, feature="exon"):
 def carve_domain(chrom, d_start, d_end, genes):
     """Carve one domain into intergenic sienas.
 
-    Returns a list of (siena_start, siena_end, left_gene, right_gene, n_genes),
-    where left/right_gene is a gene_id or 'domain_start'/'domain_end'.
+    Returns (sienas, gene_bodies):
+      sienas      -- list of (siena_start, siena_end, left_gene, right_gene,
+                     n_genes); left/right_gene is a gene_id or
+                     'domain_start'/'domain_end'.
+      gene_bodies -- list of (gene_start, gene_end, gene_id) for every gene
+                     overlapping the domain (FULL span, not clipped).
     """
     if chrom not in genes:
         # No annotation on this contig: the whole domain is one siena.
-        return [(d_start, d_end, "domain_start", "domain_end", 0)]
+        return [(d_start, d_end, "domain_start", "domain_end", 0)], []
 
     g_start, g_end, g_id = genes[chrom]
     # Genes overlapping the domain: gene_start <= d_end AND gene_end >= d_start
     mask = (g_start <= d_end) & (g_end >= d_start)
     n_genes = int(mask.sum())
+    gene_bodies = list(zip(g_start[mask].tolist(),
+                           g_end[mask].tolist(),
+                           g_id[mask].tolist()))
     if n_genes == 0:
-        return [(d_start, d_end, "domain_start", "domain_end", 0)]
+        return [(d_start, d_end, "domain_start", "domain_end", 0)], []
 
     # Clip overlapping gene bodies to the domain, sort by clipped start.
     cs = np.maximum(g_start[mask], d_start)
@@ -140,7 +156,7 @@ def carve_domain(chrom, d_start, d_end, genes):
     if cursor <= d_end:
         sienas.append((cursor, d_end, prev_gene, "domain_end", n_genes))
 
-    return sienas
+    return sienas, gene_bodies
 
 
 def main():
@@ -179,9 +195,17 @@ def main():
                     help="Keep domains with Score >= this")
     ap.add_argument("--min-len", type=int, default=0,
                     help="Drop sienas shorter than this many bp (0 = keep all)")
+    ap.add_argument("--require-genic-domain", action="store_true",
+                    help="Keep only single_gene + multi_gene sienas (those next "
+                         "to a gene body inside an induced domain); drops the "
+                         "gene_free class from the siena outputs")
     ap.add_argument("--out-csv", required=True, help="Output siena table (CSV)")
     ap.add_argument("--out-bed", default=None,
                     help="Optional BED6 output (0-based, half-open)")
+    ap.add_argument("--out-genebed", default=None,
+                    help="Optional gene-body BED6 for single_gene + multi_gene "
+                         "domains that yield >=1 qualifying siena "
+                         "(0-based, half-open; full gene spans)")
     args = ap.parse_args()
 
     genes, n_genes_total = build_gene_bodies(args.gtf, feature=args.feature)
@@ -224,23 +248,31 @@ def main():
         sys.exit("ERROR: no domains pass the thresholds; nothing to carve.")
 
     rows = []
+    gene_rows = []   # (Chrom, gene_start, gene_end, gene_id, domain_start, domain_end, n_genes)
     domains_with_siena = 0
     for r in dom.itertuples(index=False):
         c = getattr(r, "Chrom")
         ds = int(getattr(r, "domain_start"))
         de = int(getattr(r, "domain_end"))
-        sien = carve_domain(c, ds, de, genes)
+        sien, gbodies = carve_domain(c, ds, de, genes)
         if sien:
             domains_with_siena += 1
         n_in_dom = len(sien)
         for k, (a, b, lg, rg, ng) in enumerate(sien, start=1):
             rows.append((c, ds, de, a, b, lg, rg, ng, k, n_in_dom))
+        for gs, ge, gid in gbodies:
+            gene_rows.append((c, gs, ge, gid, ds, de, len(gbodies)))
 
     cols = ["Chrom", "domain_start", "domain_end", "siena_start", "siena_end",
             "left_gene", "right_gene", "n_genes_in_domain",
             "siena_idx_in_domain", "n_sienas_in_domain"]
     S = pd.DataFrame(rows, columns=cols)
     S["siena_len"] = S.siena_end - S.siena_start + 1
+
+    # domain_class from gene count: 0 -> gene_free, 1 -> single_gene, >=2 -> multi_gene
+    def _dom_class(n):
+        return "gene_free" if n == 0 else ("single_gene" if n == 1 else "multi_gene")
+    S["domain_class"] = S.n_genes_in_domain.map(_dom_class)
 
     # Inherit parent-domain statistics.
     if carry:
@@ -251,6 +283,13 @@ def main():
     n_before = len(S)
     if args.min_len > 0:
         S = S[S.siena_len >= args.min_len].copy()
+
+    # Optional: keep only sienas next to an induced gene body (single/multi gene).
+    if args.require_genic_domain:
+        n_pre = len(S)
+        S = S[S.domain_class.isin(["single_gene", "multi_gene"])].copy()
+        print(f"[filter] require-genic-domain: {n_pre:,} -> {len(S):,} sienas "
+              f"(dropped gene_free)", file=sys.stderr)
 
     # Stable IDs after sorting by genomic position.
     S = S.sort_values(["Chrom", "siena_start", "siena_end"]).reset_index(drop=True)
@@ -269,6 +308,29 @@ def main():
             "strand": ".",
         })
         bed.to_csv(args.out_bed, sep="\t", header=False, index=False)
+
+    if args.out_genebed:
+        # Gene bodies belonging to single_gene + multi_gene domains that still
+        # have >=1 siena after all thresholds. Keyed on the surviving sienas in S.
+        keep_dom = S.loc[S.domain_class.isin(["single_gene", "multi_gene"]),
+                         ["Chrom", "domain_start", "domain_end"]].drop_duplicates()
+        GB = pd.DataFrame(gene_rows, columns=["Chrom", "gene_start", "gene_end",
+                                              "gene_id", "domain_start",
+                                              "domain_end", "n_genes_in_domain"])
+        GB = GB.merge(keep_dom, on=["Chrom", "domain_start", "domain_end"], how="inner")
+        GB = GB.drop_duplicates(["Chrom", "gene_start", "gene_end", "gene_id"]) \
+               .sort_values(["Chrom", "gene_start", "gene_end"])
+        gene_bed = pd.DataFrame({
+            "chrom": GB.Chrom,
+            "start": GB.gene_start - 1,      # 1-based inclusive -> 0-based half-open
+            "end": GB.gene_end,
+            "name": GB.gene_id,
+            "score": 0,
+            "strand": ".",
+        })
+        gene_bed.to_csv(args.out_genebed, sep="\t", header=False, index=False)
+        print(f"[result] gene bodies in genebed     : {len(gene_bed):,} "
+              f"(single+multi gene domains with a qualifying siena)", file=sys.stderr)
 
     # Console summary.
     print(f"[result] domains yielding >=1 siena : {domains_with_siena:,}", file=sys.stderr)
