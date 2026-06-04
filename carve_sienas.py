@@ -27,8 +27,9 @@ Inputs
             exon-union span per gene_id (min exon start -> max exon end,
             introns included). Works with annotations that contain only
             `exon`/`CDS` records (e.g. Liftoff output) -- no `gene` lines needed.
---domains   Differential domain table (CSV). Must contain chromosome/start/end
-            plus any stat columns you want carried onto the sienas.
+--domains   Differential domain table. Delimiter is auto-detected by default
+            (comma or tab); override with --sep. Must contain chromosome/start/
+            end plus any stat columns you want carried onto the sienas.
 
 Outputs
 -------
@@ -40,11 +41,11 @@ Outputs
 Example
 -------
 python3 carve_sienas.py \
-    --gtf      SLM_r2_0-ITAG4_0.gtf \
-    --domains  H3K9ac_tomato_2h_vs_ctrl.csv \
+    --gtf      Benthi.gtf \
+    --domains  H3K9ac_Benthi_2h_vs_ctrl.csv \
     --domain-chrom '#Chromosome' --domain-start Start --domain-end End \
     --carry log2FoldChange FDR PValue Score ChIPCount InputCount \
-    --min-log2fc 1.0 --min-len 1000 \
+    --min-log2fc 0.5 --min-len 500 \
     --out-csv      sienas_classified.csv \
     --out-bed      sienas.bed \
     --out-genebed  gene_bodies.bed
@@ -165,15 +166,18 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--gtf", required=True, help="Gene annotation GTF")
-    ap.add_argument("--domains", required=True, help="Differential domain CSV")
+    ap.add_argument("--domains", required=True, help="Differential domain table (CSV or TSV)")
     ap.add_argument("--feature", default="exon",
                     help="GTF feature used to build gene bodies")
+    ap.add_argument("--sep", default=None,
+                    help="Delimiter for the domain table. Default: auto-detect "
+                         "(comma or tab). Use ',' or $'\\t' to force one.")
     ap.add_argument("--domain-chrom", default="#Chromosome",
-                    help="Chromosome column name in the domain CSV")
+                    help="Chromosome column name in the domain table")
     ap.add_argument("--domain-start", default="Start",
-                    help="Start column name in the domain CSV")
+                    help="Start column name in the domain table")
     ap.add_argument("--domain-end", default="End",
-                    help="End column name in the domain CSV")
+                    help="End column name in the domain table")
     ap.add_argument("--carry", nargs="*",
                     default=["log2FoldChange", "FDR", "PValue", "Score",
                              "ChIPCount", "InputCount"],
@@ -211,15 +215,62 @@ def main():
     genes, n_genes_total = build_gene_bodies(args.gtf, feature=args.feature)
     print(f"[gtf] genes reconstructed: {n_genes_total:,}", file=sys.stderr)
 
-    dom = pd.read_csv(args.domains)
+    # Read the domain table. sep=None + engine="python" auto-detects the
+    # delimiter (comma or tab), so a raw epic2 TSV works without reformatting.
+    # An explicit --sep overrides the sniffer; accept friendly aliases and an
+    # escaped tab ('\t') because a bare literal tab is easily lost by the shell.
+    sep = args.sep
+    if sep is not None:
+        sep = {"tab": "\t", "comma": ",", "\\t": "\t", "\\\\t": "\t"}.get(sep, sep)
+    dom = pd.read_csv(args.domains, sep=sep, engine="python")
+    if dom.shape[1] == 1:
+        sys.exit(
+            "ERROR: the domain table parsed into a single column -- the "
+            "delimiter was guessed wrong.\n"
+            f"  Parsed column: {list(dom.columns)[0]!r}\n"
+            "Pass the right delimiter explicitly, e.g. --sep $'\\t' for a "
+            "tab-separated epic2 table or --sep ',' for CSV."
+        )
+
     dom = dom.rename(columns={args.domain_chrom: "Chrom",
                               args.domain_start: "domain_start",
                               args.domain_end: "domain_end"})
+
+    # Fail loudly if the chromosome/coordinate columns did not resolve, instead
+    # of crashing later inside the carve loop on a missing attribute.
+    need = ["Chrom", "domain_start", "domain_end"]
+    miss_cols = [c for c in need if c not in dom.columns]
+    if miss_cols:
+        sys.exit(
+            f"ERROR: required column(s) {miss_cols} not found after renaming.\n"
+            f"  Columns present: {list(dom.columns)}\n"
+            "Check --domain-chrom / --domain-start / --domain-end (and --sep)."
+        )
+
     carry = [c for c in args.carry if c in dom.columns]
     missing = [c for c in args.carry if c not in dom.columns]
     if missing:
         print(f"[warn] carry columns not found, skipping: {missing}", file=sys.stderr)
     print(f"[domains] induced domains: {len(dom):,}", file=sys.stderr)
+
+    # Guard: warn (or stop) if domain chromosomes don't match the GTF, the most
+    # common silent cause of "everything is gene_free".
+    gtf_chroms = set(genes.keys())
+    dom_chroms = set(dom["Chrom"].astype(str).unique())
+    overlap = gtf_chroms & dom_chroms
+    if not overlap:
+        sys.exit(
+            "ERROR: no chromosome names are shared between the GTF and the "
+            "domain table -- every domain would be 'gene_free'.\n"
+            f"  GTF examples   : {sorted(gtf_chroms)[:5]}\n"
+            f"  domain examples: {sorted(dom_chroms)[:5]}\n"
+            "Rename one side so the chromosome names match."
+        )
+    missing_chroms = dom_chroms - gtf_chroms
+    if missing_chroms:
+        print(f"[warn] {len(missing_chroms)} domain chrom(s) absent from the GTF "
+              f"(their domains become gene_free): {sorted(missing_chroms)[:10]}",
+              file=sys.stderr)
 
     # Apply domain-level thresholds before carving.
     def _apply(df, col, op, val, label):
