@@ -1,4 +1,4 @@
-# 🧬 SIENA caller
+# 🧬 SIENA carver
 
 **S**timulus-**I**nduced **EN**hancer-locus **A**nnotation — carve the intergenic
 parts of differential ChIP domains into candidate regulatory loci, straight from
