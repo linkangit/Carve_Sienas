@@ -1,408 +1,406 @@
-# SIENA caller — intergenic enhancer loci from differential ChIP domains
+# 🧬 SIENA caller
 
-**SIENA** = *Stimulus-Induced ENhancer-locus Annotation*: an intergenic
-sub-interval of a ChIP domain that gains a histone mark on stimulation.
-`carve_sienas.py` defines sienas directly from a set of differential ChIP
-domains plus a gene annotation — **no peak-annotation package (e.g. ChIPseeker)
-required**.
+**S**timulus-**I**nduced **EN**hancer-locus **A**nnotation — carve the intergenic
+parts of differential ChIP domains into candidate regulatory loci, straight from
+a domain table and a gene annotation.
 
-The worked examples use a tomato H3K9ac dataset (+JA vs. control), and the tool
-has also been run on *Nicotiana benthamiana* (see §5.3 and §9 for the
-annotation-format note that case surfaced). Nothing in the tool is species- or
-mark-specific.
+> No peak-annotation package (ChIPseeker, etc.) required. Pure `pandas` + `numpy`.
+> Works on **any genome, organism, mark, or sample** — anything that yields a
+> table of differential domains plus a GTF.
+
+A SIENA is the **intergenic portion of an induced ChIP domain** — what's left
+after you subtract the gene bodies. Each siena inherits its parent domain's
+statistics and is labelled by how it sits relative to the surrounding genes, so
+you can immediately separate 5′/promoter intervals from 3′/downstream ones, and
+emit strand-aware tracks ready for deepTools.
+
+```
+domain      |===========================================|
+genes              [ gene 1 ]          [ gene 2 ]
+sienas      |=====|           |========|          |=====|
+            siena 1            siena 2             siena 3
+```
 
 ---
 
 ## Contents
 
-| File | Purpose |
-|------|---------|
-| `carve_sienas.py` | The tool |
-| `diagnose_gtf.py` | Diagnostic: reports what the GTF parser actually sees (use when results look wrong) |
-| `run_example.sh` | One-command reproduction of the worked set |
-| `requirements.txt` | Python dependencies |
+- [Quick start](#quick-start)
+- [Install](#install)
+- [How carving works](#how-carving-works)
+- [The two labels: `domain_class` and `siena_class`](#the-two-labels)
+- [Inputs](#inputs)
+- [All flags](#all-flags)
+- [Outputs](#outputs)
+- [Which track for deepTools?](#which-track-for-deeptools)
+- [Adapting to your GTF](#adapting-to-your-gtf)
+- [Troubleshooting](#troubleshooting)
+- [Notes & caveats](#notes--caveats)
+- [Citation](#citation)
 
 ---
 
-## 1. The idea
-
-A stimulus-induced enhancer signal often appears as a broad domain of an
-activating mark (here H3K9ac) that grows on induction. But a domain called by a
-broad-peak caller usually spans gene bodies as well as the intergenic space
-between them. The regulatory element of interest is the **intergenic portion**
-of that domain — the part not inside a transcribed gene.
-
-A siena is obtained by **interval subtraction**: take an induced domain, remove
-every gene-body span it overlaps, and keep the leftover intergenic pieces. A
-domain with *N* internal genes yields **N−1 to N+1 sienas** (see §2), or none if
-it lies entirely inside a gene body.
-
-Two conventions make this exact and reproducible:
-
-- **Near-edge boundaries.** A siena is bounded by the nearest edge of each
-  flanking gene body, regardless of transcription direction (strand-agnostic).
-- **Gene body = feature-union span.** Per gene, the body runs from the minimum
-  feature start to the maximum feature end (introns included). The feature used
-  is set by `--feature` (default `exon`) and **must carry the `gene_id`
-  attribute** — see §5.2, which is the single most common source of empty
-  results.
-
-Inclusive 1-bp gaps are used throughout: a siena ends at `gene_start − 1` and
-the next resumes at `gene_end + 1`.
-
----
-
-## 2. How a domain is carved
-
-**Case A — domain begins in intergenic space.** The first siena runs from the
-domain start to the near edge of the first gene; each subsequent siena spans the
-gap between consecutive genes; the last runs from the final gene to the domain
-end.
-
-```
-domain        |=================================================|
-genes                 [ gene 1 ]            [ gene 2 ]
-sienas        |======|          |==========|          |=========|
-              siena 1            siena 2                siena 3
-```
-
-**Case B — domain begins inside a gene body.** No siena starts at the domain
-start (it is genic); the first siena begins at that gene's far edge.
-
-```
-domain              |===========================================|
-genes        [ ---- gene 1 ---- ]         [ gene 2 ]
-sienas                           |========|          |==========|
-                                  siena 1             siena 2
-```
-
-**Siena count vs. gene count.** An N-gene domain produces N−1, N, or N+1 sienas
-depending on its edges: each domain edge that falls in intergenic space adds a
-flanking siena, each edge inside a gene body does not. Both edges genic → N−1
-sienas; both intergenic → N+1; mixed → N. This is why a siena track and a
-gene-body track for the same domains have different row counts by construction
-(see §9).
-
-Real rows from the tomato run:
-
-| Case | Domain | Gene(s) in domain | Sienas produced |
-|------|--------|-------------------|-----------------|
-| A | `ch01:370,200–374,599` | Solyc01g005000.3 (+, 371,778–374,003) | `370,200–371,777` and `374,004–374,599` |
-| B | `ch01:401,000–404,999` | Solyc01g005020.3 (−, 389,305–402,708); Solyc01g005030.4 (+, 404,753–412,977) | `402,709–404,752` |
-
-In Case B the domain opens inside the minus-strand gene Solyc01g005020, so the
-siena begins at that gene's near (right) edge — the near-edge rule in action.
-
----
-
-## 3. Domain classes
-
-Every siena is labelled by how many genes its parent domain spans:
-
-| `domain_class` | Genes in parent domain | Meaning |
-|----------------|------------------------|---------|
-| `gene_free` | 0 | Fully intergenic domain; the whole domain is one siena. Not adjacent to any induced gene body. |
-| `single_gene` | 1 | Domain spans one gene. |
-| `multi_gene` | ≥2 | Domain spans two or more genes. |
-
-`single_gene` and `multi_gene` sienas are, by construction, adjacent to a gene
-body lying **inside an induced domain** — i.e. "near an induced gene body."
-`gene_free` sienas are not. The `--require-genic-domain` flag (§6) keeps only
-the single/multi classes when that adjacency is part of your definition.
-
-> **If you build from `transcript` and `gene_id == transcript_id`** (some
-> annotations, including the Nb GTF in §5.3), each isoform counts as its own
-> "gene," so a single multi-isoform gene can be labelled `multi_gene`. Carving
-> stays correct (overlapping isoforms merge into one genic block), but the
-> *counts* and `left_gene`/`right_gene` labels are per-transcript. Collapse
-> isoforms first if true gene-level classes matter.
-
----
-
-## 4. Install
+## Quick start
 
 ```bash
-pip install -r requirements.txt   # pandas, numpy
-```
+pip install pandas numpy
 
-Python 3.8+.
-
----
-
-## 5. Inputs
-
-### 5.1 Differential domain table (`--domains`)
-
-One row per domain, with chromosome / start / end plus any statistics to carry
-onto the sienas. Defaults expect epic2-style headers; override if yours differ:
-
-| What | Default column | Flag |
-|------|----------------|------|
-| Chromosome | `#Chromosome` | `--domain-chrom` |
-| Start | `Start` | `--domain-start` |
-| End | `End` | `--domain-end` |
-| Stats to inherit | `log2FoldChange FDR PValue Score ChIPCount InputCount` | `--carry` |
-
-Coordinates are treated as 1-based inclusive (as epic2 emits).
-
-**Delimiter is auto-detected.** The table may be comma- *or* tab-separated; raw
-epic2 output (which is tab-separated even when named `.csv`) works untouched.
-Override with `--sep` if needed — it accepts `,`, the escaped tab `'\t'`, or the
-aliases `comma` / `tab`. (A bare literal tab, `--sep $'\t'`, is easily dropped by
-the shell; prefer `--sep '\t'` or `--sep tab`.)
-
-If the table parses into a single column, the tool stops with a clear error
-naming the delimiter it guessed — that means the separator was wrong, not that
-the data is bad.
-
-### 5.2 Gene annotation (`--gtf`)
-
-Gene bodies are reconstructed as the **feature-union span per `gene_id`**
-(minimum feature start → maximum feature end, introns included). Works with
-annotations that have no explicit `gene` lines (e.g. Liftoff output).
-
-**The `gene_id "..."` attribute must be present on the feature you build from**
-(set by `--feature`, default `exon`). This is the critical requirement:
-
-- Tomato/ITAG-style GTF — `gene_id` is on the `exon` lines → use the default
-  (`--feature exon`).
-- Some GTFs put `gene_id` only on `transcript` lines while `exon` lines carry
-  just `transcript_id`. With the default `--feature exon` the parser finds no
-  `gene_id`, builds (almost) no gene bodies, and **every domain comes back
-  `gene_free`** even though genes clearly sit at those loci in IGV. Build from
-  the feature that carries `gene_id` instead — usually `--feature transcript`.
-
-Run `diagnose_gtf.py` (§10) if unsure which feature carries `gene_id`.
-
-### 5.3 *N. benthamiana* example (the `--feature transcript` case)
-
-The Nb GTF used here has `gene_id` on `transcript` rows only; its `exon` rows
-carry `transcript_id` alone. The fix is one flag — `--feature transcript`:
-
-```bash
 python3 carve_sienas.py \
-  --gtf          Benthi.gtf \
-  --domains      H3K9ac_Benthi_2h_vs_ctrl.csv \
-  --feature      transcript \
-  --domain-chrom '#Chromosome' --domain-start Start --domain-end End \
-  --carry        log2FoldChange FDR PValue Score ChIPCount InputCount \
-  --min-log2fc   0.5 \
-  --min-len      500 \
-  --out-csv      sienas_classified.csv \
-  --out-bed      sienas.bed \
-  --out-genebed  gene_bodies.bed
+  --gtf      annotation.gtf \
+  --domains  diff_domains.csv \
+  --min-log2fc 1.0 \
+  --min-len    1000 \
+  --out-csv            sienas_classified.csv \
+  --out-bed            sienas.bed \
+  --out-genebed        gene_bodies.bed \
+  --out-flanking-genebed flanking_gene_bodies.bed \
+  --out-promoter-bed   promoter_sienas.bed \
+  --out-downstream-bed downstream_sienas.bed
 ```
 
-`transcript` is the right choice here because it carries `gene_id` and its
-coordinates already span the full transcript (UTRs included).
+Every output except `--out-csv` is optional — ask only for the tracks you need.
+Two flags adapt the tool to how your GTF is built (see
+[Adapting to your GTF](#adapting-to-your-gtf)):
 
-### 5.4 Input validation (built-in guards)
+- **`--feature transcript`** if `gene_id` is on `transcript` lines, not `exon`
+  lines. Default is `exon`.
+- **`--strip-suffix=<str>`** to collapse alternative transcripts onto one locus
+  (e.g. `--strip-suffix=.t`). ⚠️ Use the `=` form — a leading-dash value is
+  misread by argparse.
 
-Before carving, the tool fails loudly rather than producing misleading output:
-
-| Guard | Condition | Behaviour |
-|-------|-----------|-----------|
-| Single-column | domain table parsed to 1 column | **Error** — delimiter wrong; pass `--sep` |
-| Missing columns | `Chrom`/`Start`/`End` unresolved after rename | **Error** — check `--domain-chrom/-start/-end` and `--sep` |
-| No shared chromosomes | GTF and domains share no chrom names | **Error** — every domain would be `gene_free`; rename one side |
-| Partial chromosome match | some domain chroms absent from the GTF | **Warning** — those domains become `gene_free` |
-| No genes | no `--feature` records with `gene_id` in the GTF | **Error** — wrong `--feature` or non-GTF attribute format |
+The domain table's delimiter (comma **or** tab) is auto-detected, so a raw caller
+table (e.g. an epic2 TSV) works untouched.
 
 ---
 
-## 6. Usage
-
-Minimal:
+## Install
 
 ```bash
-python3 carve_sienas.py --gtf annotation.gtf --domains diff_domains.csv \
-  --out-csv sienas.csv
+pip install -r requirements.txt   # pandas, numpy   (Python 3.8+)
 ```
 
-Full worked set (also in `run_example.sh`):
+---
 
-```bash
-python3 carve_sienas.py \
-  --gtf          SLM_r2_0-ITAG4_0.gtf \
-  --domains      H3K9ac_tomato_2h_vs_ctrl.csv \
-  --domain-chrom '#Chromosome' --domain-start Start --domain-end End \
-  --carry        log2FoldChange FDR PValue Score ChIPCount InputCount \
-  --min-log2fc   1.0 \
-  --min-len      1000 \
-  --require-genic-domain \
-  --out-csv      sienas_classified.csv \
-  --out-bed      sienas.bed \
-  --out-genebed  gene_bodies.bed
+## How carving works
+
+A stimulus-induced signal often appears as a broad domain of an activating mark
+that grows on induction, spanning gene bodies *and* the intergenic space between
+them. SIENA isolates the intergenic space by **interval subtraction**: take a
+domain, remove every gene-body span it overlaps, keep the leftover non-genic
+pieces.
+
+**Conventions**
+
+- A domain with **N** internal genes yields **N−1 to N+1** sienas. A domain
+  wholly inside a gene body yields none.
+- Boundaries use the **nearest edge** of each flanking gene body (strand-agnostic)
+  with inclusive 1-bp gaps: a siena ends at `gene_start − 1`; the next resumes at
+  `gene_end + 1`.
+- A **gene body** is the feature-union span per gene/locus (min feature start →
+  max feature end, introns included).
+
+### Case A — domain begins and ends in intergenic space
+
+```
+domain      |===========================================|
+genes              [ gene 1 ]          [ gene 2 ]
+sienas      |=====|           |========|          |=====|
+            siena 1            siena 2             siena 3
 ```
 
-### Parsing flags
+### Case B — a domain edge falls *inside* a gene body
 
-| Flag | Default | Purpose |
+If the domain **starts inside** a gene (or **ends inside** one), the genic stretch
+is **not** emitted as a siena — carving resumes at that gene's far edge. No genic
+sequence leaks into a siena:
+
+```
+domain            |=====================================|
+genes      [ ---- gene 1 ---- ]        [ gene 2 ]
+sienas                          |======|          |=====|
+                                siena 1            siena 2
+```
+
+Worked example — domain `11000–25000` opens inside gene 1 (`9000–13000`) and ends
+intergenic at `25000`, gene 2 at `18000–20000`:
+
+| siena | coordinates | bounded by | note |
+|-------|-------------|------------|------|
+| — | (11000–13000) | — | inside gene 1 → **no siena** |
+| 1 | `13001–17999` | gene 1 → gene 2 | starts at gene 1's far edge |
+| 2 | `20001–25000` | gene 2 → domain end | runs to the intergenic domain end |
+
+The rule is symmetric for a domain ending inside a gene.
+
+---
+
+## The two labels
+
+Every siena carries two labels so you can slice the output without re-deriving
+anything.
+
+### `domain_class` — what the parent **domain** spans
+
+| value | genes in parent domain |
+|-------|------------------------|
+| `gene_free` | 0 — fully intergenic domain |
+| `single_gene` | 1 |
+| `multi_gene` | ≥ 2 |
+
+### `siena_class` — the siena's **promoter side** (strand-aware)
+
+| value | meaning |
+|-------|---------|
+| `gene_free` | no flanking gene |
+| `single_gene_5prime` · `multi_gene_5prime` | siena is the **5′ / promoter** interval of ≥ 1 flanking gene — right gene is `+` **or** left gene is `−` |
+| `single_gene_3prime` · `multi_gene_3prime` | genic flank(s) but promoter of **none** — downstream-only, convergent (`+` left / `−` right), or strand-unresolved |
+
+The CSV also reports `left_strand` / `right_strand`, so every call is auditable.
+
+> **Divergent / convergent sienas serve two genes.** A siena with a `−` gene on
+> its left and a `+` gene on its right is the shared 5′ promoter of *both*; one
+> with `+` on the left and `−` on the right is the 3′ region of both. The per-gene
+> tracks (`--out-promoter-bed`, `--out-downstream-bed`) emit such a siena once per
+> gene, each with that gene's strand.
+
+---
+
+## Inputs
+
+### Domain table — `--domains`
+
+One row per domain. Defaults expect epic2-style headers (override as needed):
+
+| field | default column | flag |
+|-------|----------------|------|
+| chromosome | `#Chromosome` | `--domain-chrom` |
+| start | `Start` | `--domain-start` |
+| end | `End` | `--domain-end` |
+| stats to inherit | `log2FoldChange FDR PValue Score ChIPCount InputCount` | `--carry` |
+
+Coordinates are 1-based inclusive. Delimiter (comma/tab) is auto-detected; force
+it with `--sep` (`,`, `'\t'`, `comma`, or `tab`). Any differential-domain caller
+works once the chrom/start/end columns are mapped.
+
+### Gene annotation — `--gtf`
+
+Gene bodies = feature-union span per `gene_id`, strand from column 7.
+**The `gene_id "…"` attribute must be on whatever feature `--feature` selects.**
+See [Adapting to your GTF](#adapting-to-your-gtf).
+
+---
+
+## All flags
+
+<details>
+<summary><b>Parsing & annotation</b></summary>
+
+| flag | default | purpose |
 |------|---------|---------|
-| `--feature` | `exon` | GTF feature to build gene bodies from; **must carry `gene_id`** (use `transcript` if `gene_id` is not on exons) |
-| `--sep` | auto-detect | Domain-table delimiter; `,`, `'\t'`, `comma`, or `tab` |
-| `--domain-chrom` / `--domain-start` / `--domain-end` | `#Chromosome` / `Start` / `End` | Column names in the domain table |
-| `--carry` | log2FoldChange FDR PValue Score ChIPCount InputCount | Domain columns inherited onto each siena |
+| `--gtf` | *(required)* | gene annotation GTF |
+| `--domains` | *(required)* | differential domain table (CSV or TSV) |
+| `--feature` | `exon` | feature to build bodies from; **must carry `gene_id`** |
+| `--strip-suffix` | none | collapse isoforms to loci (`--strip-suffix=.t`) |
+| `--sep` | auto | domain delimiter (`,`, `'\t'`, `comma`, `tab`) |
+| `--domain-chrom` / `--domain-start` / `--domain-end` | `#Chromosome` / `Start` / `End` | domain column names |
+| `--carry` | log2FoldChange FDR PValue Score ChIPCount InputCount | columns inherited onto each siena |
 
-### Thresholds
+</details>
 
-Significance / effect-size thresholds apply to the **parent domains** and act
-**before** carving — sienas inherit their domain's statistics, so a
-"differential" cutoff filters which domains may contribute sienas. Each
-threshold logs how many domains it removed.
+<details>
+<summary><b>Thresholds</b> (applied to parent domains, before carving)</summary>
 
-| Flag | Keeps | Typical use |
-|------|-------|-------------|
-| `--min-log2fc` | `log2FoldChange >= value` | `1.0` for ≥2-fold gains |
-| `--min-abs-log2fc` | `|log2FoldChange| >= value` | two-sided (gains **and** losses) |
-| `--max-fdr` | `FDR <= value` | `0.05` standard, `0.01` strict |
-| `--max-pvalue` | `PValue <= value` | raw-p alternative |
-| `--min-score` | `Score >= value` | caller signal floor |
-| `--min-len` | siena length `>= value` bp | drop short slivers (**acts on sienas only**, never on gene bodies) |
-| `--require-genic-domain` | single_gene + multi_gene only | enforce "near an induced gene body" |
+| flag | keeps | typical |
+|------|-------|---------|
+| `--min-log2fc` | `log2FoldChange ≥ value` | `1.0` (≥ 2-fold gain) |
+| `--min-abs-log2fc` | `|log2FoldChange| ≥ value` | two-sided (gains + losses) |
+| `--max-fdr` | `FDR ≤ value` | `0.05` / `0.01` |
+| `--max-pvalue` | `PValue ≤ value` | raw-p alternative |
+| `--min-score` | `Score ≥ value` | caller signal floor |
+| `--min-len` | siena length `≥ value` bp | **acts on sienas only**, never gene bodies |
+| `--require-genic-domain` | `single_gene` + `multi_gene` only | drops `gene_free` sienas |
 
-**Choosing values.** No universal cutoff exists. Use FDR as the significance
-lever (`0.05` sensitive, `0.01` strict). Treat the log2FC floor as a
-coverage-vs-stringency trade-off: histone marks shift more modestly than mRNA,
-so a hard 2-fold cut discards real, modest induction — many people pair a looser
-effect-size floor (~1.4–1.5×) with a strict FDR. Because statistics are
-inherited, you can carve once with no threshold and filter the output CSV later
-to explore cutoffs without rerunning.
+Stats are inherited, so you can carve once with no threshold and filter the CSV
+afterwards to explore cutoffs without rerunning.
+
+</details>
+
+<details>
+<summary><b>Outputs</b></summary>
+
+| flag | writes |
+|------|--------|
+| `--out-csv` | *(required)* full per-siena table |
+| `--out-bed` | all siena intervals (BED6, **strand-agnostic**) |
+| `--out-genebed` | every gene in a qualifying domain (BED6, strand-aware) |
+| `--out-flanking-genebed` | only genes bordering a surviving siena (BED6, strand-aware) |
+| `--out-promoter-bed` | one 5′ siena per gene (BED6, strand-resolved) |
+| `--out-downstream-bed` | one 3′ siena per gene (BED6, strand-resolved) |
+
+</details>
+
+### Built-in guards
+
+The tool fails loudly instead of producing misleading output:
+
+| condition | behaviour |
+|-----------|-----------|
+| domain table parsed to 1 column | **error** — wrong delimiter |
+| `Chrom`/`Start`/`End` unresolved | **error** — check `--domain-*` / `--sep` |
+| no chromosome names shared by GTF & domains | **error** — rename one side |
+| some domain chroms absent from GTF | warning — those become `gene_free` |
+| no `--feature` records with `gene_id` | **error** — wrong feature / non-GTF attrs |
+| a locus's records disagree on strand | warning — strand `.`, dropped from strand-resolved tracks |
 
 ---
 
-## 7. Outputs
+## Outputs
 
 ### `--out-csv` — one row per siena
 
-| Column | Meaning |
-|--------|---------|
-| `siena_id` | Stable ID assigned after sorting by position |
-| `Chrom` | Chromosome |
-| `domain_start`, `domain_end` | Parent-domain coordinates |
-| `siena_start`, `siena_end` | Siena coordinates (1-based inclusive) |
-| `left_gene`, `right_gene` | Bounding gene ID per side, or `domain_start` / `domain_end` at a domain edge |
-| `n_genes_in_domain` | Genes the parent domain overlaps |
-| `siena_idx_in_domain`, `n_sienas_in_domain` | Index of this siena and total from its domain |
-| `siena_len` | Length in bp |
-| `domain_class` | `gene_free` / `single_gene` / `multi_gene` |
-| *(carried)* | Each `--carry` column, inherited from the parent domain |
+Columns: `siena_id`, `Chrom`, `domain_start/end`, `siena_start/end` (1-based
+inclusive), `left_gene` / `right_gene`, `left_strand` / `right_strand`,
+`n_genes_in_domain`, `siena_idx_in_domain` / `n_sienas_in_domain`, `siena_len`,
+`domain_class`, `siena_class`, + every `--carry` column.
 
-The `left_gene` / `right_gene` pair gives an immediate candidate-target view for
-siena-to-gene linking.
+```bash
+# class breakdown at a glance
+cut -d, -f16 sienas_classified.csv | tail -n +2 | sort | uniq -c
+```
+*(`siena_class` is column 16 in the default order — confirm with
+`head -1 sienas_classified.csv` before scripting against the index.)*
 
-### `--out-bed` — siena intervals
+### `--out-bed` — all siena intervals
 
-BED6, **0-based half-open** (a siena at 361,800–366,799 inclusive becomes
-`361799  366799`), `siena_id` in the name field, `log2FoldChange` in the score
-field for browser shading.
+BED6, 0-based half-open, `siena_id` in name, `log2FoldChange` in score.
+**Column 6 is `.`** — a siena is intergenic and has no intrinsic strand (it can
+flank genes of opposite orientation), so this track is strand-agnostic by design.
 
-### `--out-genebed` — induced gene bodies
+### `--out-genebed` — induced gene bodies *(strand-aware)*
 
-BED6 of the **full gene-body spans** belonging to `single_gene` + `multi_gene`
-domains that yield at least one qualifying siena — i.e. the induced gene bodies
-that the sienas sit next to. Deduplicated, so a gene shared by adjacent domains
-appears once. Pairs with `--out-bed` as a genic track alongside the intergenic
-sienas.
+Full gene-body spans inside `single_gene` + `multi_gene` domains that yield ≥ 1
+qualifying siena, deduplicated. Column 6 carries the gene strand.
 
-> The siena BED and the gene-body BED have **different row counts by design**
-> (see §2 and §9). This is expected for paired metagene tracks, not an error.
+### `--out-flanking-genebed` — genes flanking a siena *(strand-aware)*
+
+A **stricter** version of `--out-genebed`: only genes that are a
+`left_gene`/`right_gene` of a siena that **survived all thresholds**. Interior
+genes whose flanking sienas were all filtered out are excluded. One row per gene.
+
+| output | example domain `G1 G2 G3`, short gaps around `G2` |
+|--------|-----------------------------------------------------|
+| `--out-genebed` | `G1, G2, G3` (all genes in the qualifying domain) |
+| `--out-flanking-genebed` | `G1, G3` (only genes bordering a surviving siena) |
+
+### `--out-promoter-bed` — one 5′ siena per gene *(strand-resolved)*
+
+For each gene, the siena on its **5′/upstream** side (left siena for `+`, right
+siena for `−`), named by the gene, strand = the gene's strand. Divergent
+promoters are emitted once per gene. Feed to `computeMatrix scale-regions`.
+
+### `--out-downstream-bed` — one 3′ siena per gene *(strand-resolved)*
+
+The mirror of the promoter track: for each gene, the siena on its **3′/downstream**
+side (right siena for `+`, left siena for `−`), named by the gene, strand = the
+gene's strand. Convergent sienas are emitted once per gene.
+
+> `--out-promoter-bed` and `--out-downstream-bed` are name-matched per gene, so a
+> gene's promoter row and downstream row share a key — handy for paired analyses.
 
 ---
 
-## 8. Worked result (tomato H3K9ac, +JA vs ctrl)
+## Which track for deepTools?
 
-With `--min-log2fc 1.0 --min-len 1000 --require-genic-domain`:
+| goal | anchor on | mode |
+|------|-----------|------|
+| Gene-focused metagene | `gene_bodies.bed` | `scale-regions` / `reference-point` |
+| Gene-focused, sienas-only | `flanking_gene_bodies.bed` | `scale-regions` / `reference-point` |
+| Promoter (5′) metagene | `promoter_sienas.bed` | `scale-regions` |
+| Downstream (3′) metagene | `downstream_sienas.bed` | `scale-regions` |
 
-- 17,797 induced domains → 1,899 pass log2FC ≥ 1.0
-- Sienas before the genic-domain filter: 1,922 (`gene_free` 1,094, `single_gene`
-  431, `multi_gene` 397)
-- **Final sienas: 828** (single + multi gene)
-- **Gene bodies (`gene_bodies.bed`): 839** induced gene bodies adjacent to those
-  sienas
+All strand-aware BEDs let deepTools flip `−` rows so everything aligns 5′→3′. The
+siena BED and gene-body BED have **different row counts by design** — expected for
+paired tracks, not an error.
+
+> For a single **continuous** 5′→gene→3′ metagene, give deepTools the gene bodies
+> with flanking windows in one `scale-regions` call (`--beforeRegionStartLength` /
+> `--afterRegionStartLength`) rather than stitching three separate plots — each
+> separate `scale-regions` run rescales its panel independently, so joins won't be
+> smooth.
 
 ---
 
-## 9. Notes and caveats
+## Adapting to your GTF
 
-- **Siena count ≠ gene-body count, by construction.** For an N-gene domain the
-  siena count is N−1 to N+1 (domain-edge geometry, §2), while the gene-body count
-  is N. On top of that: `--min-len` drops short *sienas* but never gene bodies;
-  `--min-log2fc` filters whole domains so it scales both together;
-  `gene_bodies.bed` is deduplicated; and if you build from `transcript` with
-  `gene_id == transcript_id`, isoforms inflate the body count without each adding
-  a siena. Net: the two tracks legitimately differ in size — a "gap" in paired
-  metagene plots needs no reconciliation.
-- **Domain-level fold-change is a proxy for gene-body induction.** A gene body is
-  treated as "induced" because it lies inside a domain whose aggregate
-  log2FoldChange passed threshold — not because H3K9ac was measured over that
-  gene body specifically (per-gene counts are not used).
-- **`gene_id` must be on the `--feature` you select.** If results are all
-  `gene_free` but IGV shows genes there, the feature/`gene_id` pairing is almost
-  always the cause (§5.2, §11). Run `diagnose_gtf.py`.
-- **Feature-union gene bodies.** A domain extending past a gene's last annotated
-  exon into a long 3′-UTR-like tail treats that tail as siena. Provide a
-  UTR-aware annotation (or build from `transcript`, which includes UTRs) if this
-  matters.
-- **Compact genomes.** "Intergenic" means "not inside a gene body," not "far
-  from any gene." The `left_gene` / `right_gene` columns let you check proximity
-  per siena.
-- **No strand logic.** Boundaries are gene-body edges; the tool never branches on
-  strand. Intentional, so every intergenic gap is kept.
-- **Reproducibility.** All behaviour is driven by flags; the stderr run summary
-  records gene count, domain count, and every threshold applied, so a logged
+The only thing that varies between annotations is where `gene_id` lives and how
+isoforms are named. Set `--feature` and `--strip-suffix` accordingly:
+
+| your GTF | `--feature` | `--strip-suffix` |
+|----------|-------------|------------------|
+| `gene_id` on `exon` lines (Ensembl/ITAG-style) | `exon` (default) | only if isoform id splits the locus |
+| `gene` / `transcript` lines present, all carry `gene_id` | `gene` (full body to gene end) | usually none |
+| `gene_id` only on `transcript` lines | `transcript` | as needed |
+| only `exon`/`CDS` records (e.g. Liftoff) | `exon` (or `CDS`) | as needed |
+| GFF3 (`ID=…;Parent=…`, no `gene_id`) | — | convert first: `gffread in.gff3 -T -o out.gtf` |
+
+**Isoforms:** if `gene_id` is already the bare locus (e.g. `AT1G01010`, with the
+`.1/.2` in `transcript_id`), you need **no** `--strip-suffix` — isoforms collapse
+automatically. If the locus id itself carries an isoform suffix (e.g.
+`GENE.1`, `GENE.2`), use `--strip-suffix=.`. Inspect with:
+
+```bash
+grep -m1 -P '\texon\t' annotation.gtf      # see which attrs the exon lines carry
+```
+
+**Chromosome names must match** between the GTF and the domain table (`Chr1` vs
+`chr1` vs `1` vs RefSeq `NC_003070.9`). Quick check:
+
+```bash
+comm -12 <(grep -v '^#' annotation.gtf | cut -f1 | sort -u) \
+         <(tail -n +2 diff_domains.csv | cut -f1 | sort -u)
+```
+
+---
+
+## Troubleshooting
+
+<details>
+<summary><b>"All my sienas are <code>gene_free</code>" (but IGV shows genes there)</b></summary>
+
+1. **Wrong delimiter.** Many callers emit tab-separated tables even when named
+   `.csv`. Check `head -2 file | cat -A` (tabs show as `^I`); auto-detect usually
+   handles it, else pass `--sep tab`.
+2. **Chromosome-name mismatch** (`Chr1` vs `chr1` vs `1`). No shared names →
+   error; partial → warning.
+3. **`gene_id` not on the chosen `--feature`** *(most common)*. If `exon` rows
+   carry only `transcript_id`, use `--feature transcript`.
+4. **GFF3 mislabelled `.gtf`** (`ID=…;Parent=…`, no `gene_id`). Convert with
+   `gffread in.gff3 -T -o out.gtf`.
+
+After fixing, delete the stale `*_classified.csv` and rerun. The stderr summary
+should show a real `genes reconstructed` count and a real `siena_class breakdown`.
+
+</details>
+
+---
+
+## Notes & caveats
+
+- **Domain-level fold-change is a proxy for induction.** A siena/gene is "induced"
+  because its domain's aggregate log2FoldChange passed threshold — not because the
+  mark was measured over that interval. To strengthen the claim, recount reads
+  over the siena coordinates directly and test treatment vs control there.
+- **Siena count ≠ gene-body count, by construction** — N−1…N+1 sienas vs N bodies
+  per domain; `--min-len` filters sienas only; gene BEDs are deduplicated.
+- **No strand logic in carving.** Boundaries are gene-body edges; strand enters
+  only in the labels and the strand-aware BEDs.
+- **Reproducibility.** All behaviour is flag-driven; the stderr summary logs gene
+  count, domain count, every threshold, and the `siena_class` breakdown — a logged
   command fully reproduces a result.
 
 ---
 
-## 10. Diagnostics (`diagnose_gtf.py`)
-
-When results look wrong, this mirrors the tool's own parser and prints exactly
-what it sees:
-
-```bash
-python3 diagnose_gtf.py annotation.gtf diff_domains.csv
-```
-
-It reports the GTF's column-3 feature types and counts, the column-1 chromosome
-names, sample column-9 attribute strings (so you can see whether `gene_id "..."`
-is present and on which feature), how many gene bodies the tool would build, and
-whether your first few domains overlap any of them. The number of genes it would
-build is the single most decisive value: if it is tiny, your `--feature` /
-`gene_id` pairing is wrong.
-
----
-
-## 11. Troubleshooting: "all my sienas are `gene_free`"
-
-Work down this list; each step has a matching guard or diagnostic.
-
-1. **Wrong delimiter.** Raw epic2 tables are tab-separated even when named
-   `.csv`. Auto-detection handles this; if you forced `--sep` incorrectly the
-   tool errors with the column it parsed. Check with `head -2 file | cat -A`
-   (tabs show as `^I`).
-2. **Chromosome-name mismatch.** The domains and GTF must use the same names
-   (`Chr01` vs `chr1` vs `Niben…`). No shared names → error; partial overlap →
-   warning. Confirm with
-   `comm -12 <(cut -f1 ann.gtf | grep -v '^#' | sort -u) <(cut -f1 dom | sort -u)`.
-3. **`gene_id` not on the `--feature` you chose (most common).** If `exon` rows
-   carry only `transcript_id`, default `--feature exon` finds no `gene_id` and
-   builds almost no genes. Switch to `--feature transcript` (or whichever feature
-   carries `gene_id`). Confirm with `diagnose_gtf.py` or
-   `grep -m1 -P '\texon\t' ann.gtf` to inspect the attribute column.
-4. **GFF3 mislabelled `.gtf`.** Attributes like `ID=...;Parent=...` (no
-   `gene_id "..."`) are GFF3. Convert to true GTF, e.g.
-   `gffread in.gff3 -T -o out.gtf`.
-
-After fixing, delete the stale `*_classified.csv` so you don't confuse it with
-the new run, then check the stderr summary: `[gtf] genes reconstructed:` should
-be in the tens of thousands and `single_gene` / `multi_gene` classes should
-appear.
-
----
-
-## 12. Citation
+## Citation
 
 If you use this in a publication, please cite this repository together with the
-domain caller (e.g. epic2) and gene annotation you supplied. Issues and pull
-requests welcome.
+differential-domain caller (e.g. epic2) and the gene annotation you supplied.
