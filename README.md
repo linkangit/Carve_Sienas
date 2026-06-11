@@ -14,13 +14,6 @@ statistics and is labelled by how it sits relative to the surrounding genes, so
 you can immediately separate 5′/promoter intervals from 3′/downstream ones, and
 emit strand-aware tracks ready for deepTools.
 
-```
-domain      |===========================================|
-genes              [ gene 1 ]          [ gene 2 ]
-sienas      |=====|           |========|          |=====|
-            siena 1            siena 2             siena 3
-```
-
 ---
 
 ## Contents
