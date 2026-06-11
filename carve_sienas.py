@@ -7,19 +7,34 @@ of differential ChIP domains and a gene annotation -- no ChIPseeker required.
 
 A SIENA is an intergenic sub-interval of an induced domain: take each domain,
 remove every gene-body span it overlaps, and keep the leftover non-genic pieces.
-A domain with N internal genes yields up to N+1 sienas; a domain lying entirely
-inside a gene body yields none. Boundaries use the NEAR EDGE of each gene body
+A domain with N internal genes yields N-1 to N+1 sienas (depending on whether
+each domain edge lands in intergenic space); a domain lying entirely inside a
+gene body yields none. Boundaries use the NEAR EDGE of each gene body
 (strand-agnostic) and inclusive 1-bp gaps (siena ends at gene_start-1, the next
 resumes at gene_end+1).
 
 Each siena inherits its parent domain's statistics (log2FoldChange, FDR, ...),
-so the "stimulus-induced" status of the domain carries through. Each siena is
-also labelled with a `domain_class`:
+so the "stimulus-induced" status of the domain carries through.
+
+Two labels are attached to every siena:
+
+`domain_class` -- how many genes the PARENT DOMAIN spans:
     gene_free    parent domain spans 0 genes (fully intergenic domain)
     single_gene  parent domain spans exactly 1 gene
     multi_gene   parent domain spans 2+ genes
-single_gene and multi_gene sienas are, by construction, adjacent to a gene body
-that lies inside an induced domain (i.e. "near an induced gene body").
+
+`siena_class` -- refines that by the siena's PROMOTER SIDE (strand-aware), so you
+can see at a glance which sienas are 5'/promoter intervals and which genic ones
+are left out of --out-promoter-bed:
+    gene_free            no flanking gene (== domain_class gene_free)
+    single_gene_5prime   genic flank AND the siena is the 5'/upstream (promoter)
+    multi_gene_5prime    interval of >=1 flanking gene: right gene is '+' OR left
+                         gene is '-'. These are EXACTLY the sienas that enter
+                         --out-promoter-bed.
+    single_gene_3prime   genic flank(s) but the siena is the promoter of NO gene
+    multi_gene_3prime    (downstream-only, convergent, or strand-unresolved).
+                         These are the qualifying genic sienas LEFT OUT of
+                         --out-promoter-bed.
 
 Inputs
 ------
@@ -33,10 +48,15 @@ Inputs
 
 Outputs
 -------
---out-csv      Full siena table (CSV), incl. domain_class.
+--out-csv      Full siena table (CSV), incl. domain_class, siena_class,
+               left_strand, right_strand.
 --out-bed      Optional siena BED6 (0-based, half-open) for browsers/bedtools.
 --out-genebed  Optional gene-body BED6: full spans of the genes inside
-               single_gene + multi_gene domains that yield a qualifying siena.
+               single_gene + multi_gene domains that yield a qualifying siena
+               (strand-aware; column 6 carries the gene strand).
+--out-promoter-bed  Optional STRAND-AWARE BED6 with one 5'-flanking (promoter)
+               siena per locus -- the siena_class *_5prime set -- for deepTools
+               `computeMatrix scale-regions`.
 
 Example
 -------
@@ -62,13 +82,23 @@ import pandas as pd
 GENE_ID_RE = re.compile(r'gene_id "([^"]+)"')
 
 
-def build_gene_bodies(gtf_path, feature="exon"):
-    """Return {chrom: (starts[], ends[], ids[])} sorted by start.
+def build_gene_bodies(gtf_path, feature="exon", strip_suffix=None):
+    """Return (genes, strand_by_id, n_units, n_mixed_strand).
 
-    Gene body = exon-union span per gene_id: minimum feature start to maximum
-    feature end. Introns are included; strand is ignored (near-edge convention).
+    genes          -- {chrom: (starts[], ends[], ids[])} sorted by start.
+    strand_by_id   -- {id: '+'|'-'|'.'}; '.' if a locus's records disagree on
+                      strand (then it is excluded from strand-aware outputs).
+    n_units        -- number of bodies built (loci if strip_suffix, else genes).
+    n_mixed_strand -- number of ids dropped to '.' for strand disagreement.
+
+    Gene body = feature-union span per id (min start -> max end, introns
+    included). The id is `gene_id` from the GTF, optionally truncated at the
+    first occurrence of `strip_suffix` to collapse isoforms onto one locus
+    (e.g. strip_suffix='-mRNA' maps 'Nb01g01059-mRNA' -> 'Nb01g01059'). Strand
+    is read from GTF column 7.
     """
-    span = {}  # gene_id -> [chrom, start, end]
+    span = {}      # id -> [chrom, start, end]
+    strands = {}   # id -> set of strands seen
     with open(gtf_path) as fh:
         for line in fh:
             if line.startswith("#"):
@@ -79,15 +109,31 @@ def build_gene_bodies(gtf_path, feature="exon"):
             m = GENE_ID_RE.search(f[8])
             if not m:
                 continue
-            gid, chrom, start, end = m.group(1), f[0], int(f[3]), int(f[4])
+            gid = m.group(1)
+            if strip_suffix:
+                gid = gid.split(strip_suffix)[0]   # locus id
+            chrom, start, end, strand = f[0], int(f[3]), int(f[4]), f[6]
             if gid not in span:
                 span[gid] = [chrom, start, end]
+                strands[gid] = {strand}
             else:
                 span[gid][1] = min(span[gid][1], start)
                 span[gid][2] = max(span[gid][2], end)
+                strands[gid].add(strand)
 
     if not span:
         sys.exit(f"ERROR: no '{feature}' records with a gene_id found in {gtf_path}")
+
+    strand_by_id = {}
+    n_mixed = 0
+    for gid, sset in strands.items():
+        sset = {s for s in sset if s in ("+", "-")}
+        if len(sset) == 1:
+            strand_by_id[gid] = sset.pop()
+        else:
+            strand_by_id[gid] = "."     # none, or conflicting
+            if len(sset) > 1:
+                n_mixed += 1
 
     by_chrom = defaultdict(list)
     for gid, (chrom, start, end) in span.items():
@@ -101,7 +147,7 @@ def build_gene_bodies(gtf_path, feature="exon"):
             np.array([v[1] for v in vals]),
             np.array([v[2] for v in vals], dtype=object),
         )
-    return genes, len(span)
+    return genes, strand_by_id, len(span), n_mixed
 
 
 def carve_domain(chrom, d_start, d_end, genes):
@@ -169,6 +215,11 @@ def main():
     ap.add_argument("--domains", required=True, help="Differential domain table (CSV or TSV)")
     ap.add_argument("--feature", default="exon",
                     help="GTF feature used to build gene bodies")
+    ap.add_argument("--strip-suffix", default=None,
+                    help="Collapse isoforms to loci: truncate each gene_id at "
+                         "the first occurrence of this string to form the locus "
+                         "id (e.g. '-mRNA' maps Nb01g01059-mRNA -> Nb01g01059). "
+                         "Required for one-promoter-per-locus output.")
     ap.add_argument("--sep", default=None,
                     help="Delimiter for the domain table. Default: auto-detect "
                          "(comma or tab). Use ',' or $'\\t' to force one.")
@@ -210,10 +261,38 @@ def main():
                     help="Optional gene-body BED6 for single_gene + multi_gene "
                          "domains that yield >=1 qualifying siena "
                          "(0-based, half-open; full gene spans)")
+    ap.add_argument("--out-flanking-genebed", default=None,
+                    help="Optional gene-body BED6 of ONLY the genes directly "
+                         "flanking a siena that passed all thresholds (i.e. a "
+                         "left_gene/right_gene of the final siena set). Stricter "
+                         "than --out-genebed, which keeps every gene in a "
+                         "qualifying domain. Strand-aware; one row per gene.")
+    ap.add_argument("--out-downstream-bed", default=None,
+                    help="Optional STRAND-AWARE BED6 with exactly one 3'-flanking "
+                         "(downstream) siena per gene -- the mirror of "
+                         "--out-promoter-bed. + gene -> the siena to its right; "
+                         "- gene -> the siena to its left. Column 6 carries the "
+                         "gene strand. A convergent siena (+ gene left, - gene "
+                         "right) is the 3' region of both and is emitted once per "
+                         "gene. Use with --strip-suffix for per-locus.")
+    ap.add_argument("--out-promoter-bed", default=None,
+                    help="Optional STRAND-AWARE BED6 with exactly one 5'-flanking "
+                         "(promoter) siena per locus, for deepTools "
+                         "`computeMatrix scale-regions`. + locus -> its left "
+                         "siena; - locus -> its right siena. Column 6 carries the "
+                         "locus strand. Use with --strip-suffix for per-locus.")
     args = ap.parse_args()
 
-    genes, n_genes_total = build_gene_bodies(args.gtf, feature=args.feature)
-    print(f"[gtf] genes reconstructed: {n_genes_total:,}", file=sys.stderr)
+    genes, strand_by_id, n_genes_total, n_mixed = build_gene_bodies(
+        args.gtf, feature=args.feature, strip_suffix=args.strip_suffix)
+    unit = "loci" if args.strip_suffix else "genes"
+    print(f"[gtf] {unit} reconstructed: {n_genes_total:,}"
+          + (f" (isoforms collapsed on '{args.strip_suffix}')" if args.strip_suffix else ""),
+          file=sys.stderr)
+    if n_mixed:
+        print(f"[warn] {n_mixed:,} {unit} had conflicting strands -> strand '.', "
+              f"excluded from --out-promoter-bed", file=sys.stderr)
+
 
     # Read the domain table. sep=None + engine="python" auto-detects the
     # delimiter (comma or tab), so a raw epic2 TSV works without reformatting.
@@ -325,6 +404,23 @@ def main():
         return "gene_free" if n == 0 else ("single_gene" if n == 1 else "multi_gene")
     S["domain_class"] = S.n_genes_in_domain.map(_dom_class)
 
+    # Strand of each flank (gene/locus strand; '.' at a domain edge or if the
+    # GTF strand was missing/conflicting).
+    S["left_strand"] = S.left_gene.map(lambda g: strand_by_id.get(g, "."))
+    S["right_strand"] = S.right_gene.map(lambda g: strand_by_id.get(g, "."))
+
+    # siena_class: refine domain_class by the siena's promoter side.
+    #   *_5prime  = siena is the 5'/upstream (promoter) interval of >=1 flanking
+    #               gene  (right gene '+'  OR  left gene '-')  -> enters
+    #               --out-promoter-bed.
+    #   *_3prime  = genic flank(s) but promoter of none (downstream-only,
+    #               convergent, or strand unresolved) -> left OUT of promoter bed.
+    is_promoter = (S.right_strand == "+") | (S.left_strand == "-")
+    prefix = np.where(S.n_genes_in_domain == 1, "single_gene", "multi_gene")
+    S["siena_class"] = np.where(
+        S.n_genes_in_domain == 0, "gene_free",
+        np.where(is_promoter, prefix + "_5prime", prefix + "_3prime"))
+
     # Inherit parent-domain statistics.
     if carry:
         S = S.merge(dom[["Chrom", "domain_start", "domain_end", *carry]],
@@ -377,13 +473,148 @@ def main():
             "end": GB.gene_end,
             "name": GB.gene_id,
             "score": 0,
-            "strand": ".",
+            "strand": GB.gene_id.map(lambda g: strand_by_id.get(g, ".")),
         })
         gene_bed.to_csv(args.out_genebed, sep="\t", header=False, index=False)
         print(f"[result] gene bodies in genebed     : {len(gene_bed):,} "
               f"(single+multi gene domains with a qualifying siena)", file=sys.stderr)
 
+    if args.out_flanking_genebed:
+        # ONLY the genes directly flanking a siena that survived all thresholds:
+        # the left_gene / right_gene of the final siena table S. Stricter than
+        # --out-genebed (which keeps every gene in a qualifying domain). Full
+        # gene spans are looked up from gene_rows (unclipped), strand-aware.
+        body_by_id = {}
+        for (c, gs, ge, gid, ds, de, ng) in gene_rows:
+            body_by_id[gid] = (c, gs, ge)   # full span; consistent per gene id
+
+        flank_ids = {g for g in pd.concat([S.left_gene, S.right_gene],
+                                          ignore_index=True).unique()
+                     if g not in ("domain_start", "domain_end")}
+        fb_rows = []
+        for gid in flank_ids:
+            if gid in body_by_id:
+                c, gs, ge = body_by_id[gid]
+                fb_rows.append((c, gs - 1, ge, gid, 0,
+                                strand_by_id.get(gid, ".")))
+        fb = (pd.DataFrame(fb_rows,
+                           columns=["chrom", "start", "end", "name", "score", "strand"])
+                .drop_duplicates()
+                .sort_values(["chrom", "start", "end"]))
+        fb.to_csv(args.out_flanking_genebed, sep="\t", header=False, index=False)
+        print(f"[result] flanking gene bodies       : {len(fb):,} "
+              f"(genes directly bordering a surviving siena)", file=sys.stderr)
+
+    if args.out_promoter_bed:
+        # One 5'-flanking (promoter) siena per locus, strand-aware.
+        #   + locus: promoter = siena whose right_gene == locus (interval on its
+        #            left, i.e. upstream of a + gene).
+        #   - locus: promoter = siena whose left_gene == locus (interval on its
+        #            right, i.e. upstream of a - gene).
+        # A single intergenic siena flanked by a - gene on its left and a + gene
+        # on its right is the (shared) promoter of BOTH -> emitted once per locus
+        # (bidirectional promoter). Loci whose 5' side is genic, or whose
+        # promoter siena was removed by --min-len, have no promoter and drop out.
+        has_l2fc = "log2FoldChange" in S.columns
+
+        plus = S[S.right_gene.map(lambda g: strand_by_id.get(g, ".")) == "+"].copy()
+        plus["locus"] = plus.right_gene
+        plus["pstrand"] = "+"
+
+        minus = S[S.left_gene.map(lambda g: strand_by_id.get(g, ".")) == "-"].copy()
+        minus["locus"] = minus.left_gene
+        minus["pstrand"] = "-"
+
+        P = pd.concat([plus, minus], ignore_index=True)
+        if len(P) == 0:
+            print("[warn] --out-promoter-bed: no promoter sienas found "
+                  "(did you pass --strip-suffix, and does the GTF carry strand?)",
+                  file=sys.stderr)
+        # Exactly one per locus: if a locus has several candidates (e.g. it
+        # borders two induced domains), keep the strongest |log2FC|.
+        P["_rank"] = P["log2FoldChange"].abs() if has_l2fc else 0.0
+        P = (P.sort_values(["locus", "_rank"], ascending=[True, False])
+               .drop_duplicates("locus", keep="first"))
+
+        prom = pd.DataFrame({
+            "chrom": P.Chrom,
+            "start": P.siena_start - 1,       # 1-based inclusive -> 0-based half-open
+            "end": P.siena_end,
+            "name": P.locus,
+            "score": (P["log2FoldChange"] if has_l2fc else 0),
+            "strand": P.pstrand,
+        }).sort_values(["chrom", "start", "end"])
+        prom.to_csv(args.out_promoter_bed, sep="\t", header=False, index=False)
+
+        # Report how many strand-bearing loci in induced domains got no promoter.
+        loci_in_play = {g for g in pd.concat([S.left_gene, S.right_gene]).unique()
+                        if strand_by_id.get(g, ".") in ("+", "-")}
+        dropped = len(loci_in_play) - len(prom)
+        npos = int((prom.strand == "+").sum())
+        nneg = int((prom.strand == "-").sum())
+        print(f"[result] promoter sienas (1/locus)  : {len(prom):,} "
+              f"(+ {npos:,} / - {nneg:,})", file=sys.stderr)
+        print(f"[result] loci w/ no 5' siena dropped: {dropped:,} "
+              f"(5' side genic, or promoter siena below --min-len)", file=sys.stderr)
+
+    if args.out_downstream_bed:
+        # One 3'-flanking (downstream) siena per gene, strand-aware -- the mirror
+        # of --out-promoter-bed.
+        #   + gene: downstream = siena whose left_gene == gene (interval on its
+        #           right, i.e. 3' of a + gene).
+        #   - gene: downstream = siena whose right_gene == gene (interval on its
+        #           left, i.e. 3' of a - gene).
+        # A siena flanked by a + gene on its left and a - gene on its right is the
+        # 3' region of BOTH (convergent) -> emitted once per gene. Genes whose 3'
+        # side is genic, or whose 3' siena was removed by --min-len, drop out.
+        has_l2fc = "log2FoldChange" in S.columns
+
+        dplus = S[S.left_gene.map(lambda g: strand_by_id.get(g, ".")) == "+"].copy()
+        dplus["locus"] = dplus.left_gene
+        dplus["pstrand"] = "+"
+
+        dminus = S[S.right_gene.map(lambda g: strand_by_id.get(g, ".")) == "-"].copy()
+        dminus["locus"] = dminus.right_gene
+        dminus["pstrand"] = "-"
+
+        D = pd.concat([dplus, dminus], ignore_index=True)
+        if len(D) == 0:
+            print("[warn] --out-downstream-bed: no downstream sienas found "
+                  "(does the GTF carry strand?)", file=sys.stderr)
+        # Exactly one per gene: if a gene borders two domains, keep strongest |log2FC|.
+        D["_rank"] = D["log2FoldChange"].abs() if has_l2fc else 0.0
+        D = (D.sort_values(["locus", "_rank"], ascending=[True, False])
+               .drop_duplicates("locus", keep="first"))
+
+        down = pd.DataFrame({
+            "chrom": D.Chrom,
+            "start": D.siena_start - 1,       # 1-based inclusive -> 0-based half-open
+            "end": D.siena_end,
+            "name": D.locus,
+            "score": (D["log2FoldChange"] if has_l2fc else 0),
+            "strand": D.pstrand,
+        }).sort_values(["chrom", "start", "end"])
+        down.to_csv(args.out_downstream_bed, sep="\t", header=False, index=False)
+
+        genic = {g for g in pd.concat([S.left_gene, S.right_gene]).unique()
+                 if strand_by_id.get(g, ".") in ("+", "-")}
+        dropped_d = len(genic) - len(down)
+        npos = int((down.strand == "+").sum())
+        nneg = int((down.strand == "-").sum())
+        print(f"[result] downstream sienas (1/gene) : {len(down):,} "
+              f"(+ {npos:,} / - {nneg:,})", file=sys.stderr)
+        print(f"[result] genes w/ no 3' siena       : {dropped_d:,} "
+              f"(3' side genic, or 3' siena below --min-len)", file=sys.stderr)
+
     # Console summary.
+    print(f"[result] siena_class breakdown:", file=sys.stderr)
+    for k in ["gene_free", "single_gene_5prime", "single_gene_3prime",
+              "multi_gene_5prime", "multi_gene_3prime"]:
+        n = int((S.siena_class == k).sum())
+        if n:
+            tail = "  -> --out-promoter-bed" if k.endswith("_5prime") else (
+                   "  (left out of promoter bed)" if k.endswith("_3prime") else "")
+            print(f"    {k:<20} {n:,}{tail}", file=sys.stderr)
     print(f"[result] domains yielding >=1 siena : {domains_with_siena:,}", file=sys.stderr)
     print(f"[result] domains yielding 0 sienas  : {len(dom) - domains_with_siena:,} "
           f"(wholly inside a gene body)", file=sys.stderr)
