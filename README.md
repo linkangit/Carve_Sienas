@@ -1,4 +1,4 @@
-# SIENA carver
+# SIENA caller
 
 **S**timulus-**I**nduced **EN**hancer-locus **A**nnotation — carve the intergenic
 parts of differential ChIP domains into candidate regulatory loci, straight from
@@ -14,6 +14,13 @@ statistics and is labelled by how it sits relative to the surrounding genes, so
 you can immediately separate 5′/promoter intervals from 3′/downstream ones, and
 emit strand-aware tracks ready for deepTools.
 
+```
+domain      |===========================================|
+genes              [ gene 1 ]          [ gene 2 ]
+sienas      |=====|           |========|          |=====|
+            siena 1            siena 2             siena 3
+```
+
 ---
 
 ## Contents
@@ -27,6 +34,7 @@ emit strand-aware tracks ready for deepTools.
 - [Outputs](#outputs)
 - [Which track for deepTools?](#which-track-for-deeptools)
 - [Adapting to your GTF](#adapting-to-your-gtf)
+- [Companion: gene clusters](#companion-gene-clusters)
 - [Troubleshooting](#troubleshooting)
 - [Notes & caveats](#notes--caveats)
 - [Citation](#citation)
@@ -129,26 +137,40 @@ The rule is symmetric for a domain ending inside a gene.
 
 ## The two labels
 
-Every siena carries two labels so you can slice the output without re-deriving
-anything.
+Every siena carries two labels. **The `single_gene` / `multi_gene` distinction is
+based on the GENE CLUSTER** — the genes that flank a *qualifying* siena in the
+parent domain — **not on the raw number of genes overlapping the domain.** A gene
+that merely sits inside a domain but borders no surviving siena (e.g. boxed in by
+sub-`--min-len` gaps) does **not** count toward the class. This makes the labels
+consistent with the companion [`genes_from_domains.py`](#companion-gene-clusters).
 
-### `domain_class` — what the parent **domain** spans
+> Because the class is built from *qualifying* sienas, it depends on your
+> thresholds (notably `--min-len`): the carver applies the length filter first,
+> then labels the surviving set. Changing `--min-len` can therefore change a
+> domain's class — which is the intended, consistent behaviour.
 
-| value | genes in parent domain |
-|-------|------------------------|
-| `gene_free` | 0 — fully intergenic domain |
-| `single_gene` | 1 |
-| `multi_gene` | ≥ 2 |
-
-### `siena_class` — the siena's **promoter side** (strand-aware)
+### `domain_class` — the flanking-gene cluster size of the parent domain
 
 | value | meaning |
 |-------|---------|
-| `gene_free` | no flanking gene |
-| `single_gene_5prime` · `multi_gene_5prime` | siena is the **5′ / promoter** interval of ≥ 1 flanking gene — right gene is `+` **or** left gene is `−` |
+| `gene_free` | no gene flanks any qualifying siena in the domain |
+| `single_gene` | exactly **1** gene flanks a qualifying siena |
+| `multi_gene` | **≥ 2** genes flank qualifying sienas (a gene cluster) |
+
+The raw overlap count is still reported separately as `n_genes_in_domain`, and the
+cluster size as `n_cluster_genes`.
+
+### `siena_class` — the siena's promoter side (strand-aware)
+
+| value | meaning |
+|-------|---------|
+| `gene_free` | this siena has no flanking gene |
+| `single_gene_5prime` · `multi_gene_5prime` | siena is the **5′ / promoter** interval of ≥ 1 flanking gene — right gene is `+` **or** left gene is `−`. **Exactly the `--out-promoter-bed` set.** |
 | `single_gene_3prime` · `multi_gene_3prime` | genic flank(s) but promoter of **none** — downstream-only, convergent (`+` left / `−` right), or strand-unresolved |
 
-The CSV also reports `left_strand` / `right_strand`, so every call is auditable.
+The `single`/`multi` prefix carries the parent domain's cluster size (above); the
+`5prime`/`3prime` suffix is the siena's own orientation. The CSV also reports
+`left_strand` / `right_strand`, so every call is auditable.
 
 > **Divergent / convergent sienas serve two genes.** A siena with a `−` gene on
 > its left and a `+` gene on its right is the shared 5′ promoter of *both*; one
@@ -201,7 +223,7 @@ See [Adapting to your GTF](#adapting-to-your-gtf).
 </details>
 
 <details>
-<summary><b>Thresholds</b> (applied to parent domains, before carving)</summary>
+<summary><b>Thresholds</b> (domain-level applied before carving; <code>--min-len</code> applied to sienas, before classification)</summary>
 
 | flag | keeps | typical |
 |------|-------|---------|
@@ -210,11 +232,11 @@ See [Adapting to your GTF](#adapting-to-your-gtf).
 | `--max-fdr` | `FDR ≤ value` | `0.05` / `0.01` |
 | `--max-pvalue` | `PValue ≤ value` | raw-p alternative |
 | `--min-score` | `Score ≥ value` | caller signal floor |
-| `--min-len` | siena length `≥ value` bp | **acts on sienas only**, never gene bodies |
+| `--min-len` | siena length `≥ value` bp | **acts on sienas only**; the surviving sienas also define the gene cluster used for `single`/`multi` |
 | `--require-genic-domain` | `single_gene` + `multi_gene` only | drops `gene_free` sienas |
 
 Stats are inherited, so you can carve once with no threshold and filter the CSV
-afterwards to explore cutoffs without rerunning.
+afterwards to explore cutoffs.
 
 </details>
 
@@ -253,15 +275,17 @@ The tool fails loudly instead of producing misleading output:
 
 Columns: `siena_id`, `Chrom`, `domain_start/end`, `siena_start/end` (1-based
 inclusive), `left_gene` / `right_gene`, `left_strand` / `right_strand`,
-`n_genes_in_domain`, `siena_idx_in_domain` / `n_sienas_in_domain`, `siena_len`,
-`domain_class`, `siena_class`, + every `--carry` column.
+`n_genes_in_domain` (raw genes overlapping the domain), `n_cluster_genes` (genes
+flanking a qualifying siena — drives the class), `siena_idx_in_domain` /
+`n_sienas_in_domain`, `siena_len`, `domain_class`, `siena_class`, + every
+`--carry` column.
 
 ```bash
 # class breakdown at a glance
-cut -d, -f16 sienas_classified.csv | tail -n +2 | sort | uniq -c
+cut -d, -f<siena_class_col> sienas_classified.csv | tail -n +2 | sort | uniq -c
 ```
-*(`siena_class` is column 16 in the default order — confirm with
-`head -1 sienas_classified.csv` before scripting against the index.)*
+*(Confirm the column index with `head -1 sienas_classified.csv` before scripting,
+since `--carry` changes the layout.)*
 
 ### `--out-bed` — all siena intervals
 
@@ -272,13 +296,16 @@ flank genes of opposite orientation), so this track is strand-agnostic by design
 ### `--out-genebed` — induced gene bodies *(strand-aware)*
 
 Full gene-body spans inside `single_gene` + `multi_gene` domains that yield ≥ 1
-qualifying siena, deduplicated. Column 6 carries the gene strand.
+qualifying siena, deduplicated. Column 6 carries the gene strand. **This keeps
+every gene in a qualifying domain**, including interior ones — use the next output
+for the strict set.
 
 ### `--out-flanking-genebed` — genes flanking a siena *(strand-aware)*
 
 A **stricter** version of `--out-genebed`: only genes that are a
 `left_gene`/`right_gene` of a siena that **survived all thresholds**. Interior
-genes whose flanking sienas were all filtered out are excluded. One row per gene.
+genes whose flanking sienas were all filtered out are excluded — this set matches
+the genes that drive the cluster-based class.
 
 | output | example domain `G1 G2 G3`, short gaps around `G2` |
 |--------|-----------------------------------------------------|
@@ -330,7 +357,7 @@ isoforms are named. Set `--feature` and `--strip-suffix` accordingly:
 
 | your GTF | `--feature` | `--strip-suffix` |
 |----------|-------------|------------------|
-| `gene_id` on `exon` lines (Ensembl/ITAG-style) | `exon` (default) | only if isoform id splits the locus |
+| `gene_id` on `exon` lines (Ensembl/ITAG-style) | `exon` (default) | only if the isoform id splits the locus |
 | `gene` / `transcript` lines present, all carry `gene_id` | `gene` (full body to gene end) | usually none |
 | `gene_id` only on `transcript` lines | `transcript` | as needed |
 | only `exon`/`CDS` records (e.g. Liftoff) | `exon` (or `CDS`) | as needed |
@@ -352,6 +379,27 @@ grep -m1 -P '\texon\t' annotation.gtf      # see which attrs the exon lines carr
 comm -12 <(grep -v '^#' annotation.gtf | cut -f1 | sort -u) \
          <(tail -n +2 diff_domains.csv | cut -f1 | sort -u)
 ```
+
+---
+
+## Companion: gene clusters
+
+`genes_from_domains.py` is a domain-centric companion that produces a **gene
+list** rather than siena intervals. It keeps domains with `log2FoldChange > value`,
+carves them, keeps sienas `≥ --min-siena-len`, and reports the genes that flank
+those qualifying sienas — stringing co-occurring flanking genes into ordered
+**clusters** (`cluster_1`, `cluster_2`, …, with `cluster_order` along the genome).
+
+```bash
+python3 genes_from_domains.py \
+  --gtf annotation.gtf --domains diff_domains.csv \
+  --feature exon --min-log2fc 1 --min-siena-len 1000 \
+  --out gene_clusters.tsv
+```
+
+It uses the **same** `single_gene`/`multi_gene` definition as the carver
+(`multi_gene` ⇔ ≥ 2 genes flank a qualifying siena), so the two tools agree. Genes
+boxed in by sub-threshold sienas are excluded from both.
 
 ---
 
@@ -379,6 +427,10 @@ should show a real `genes reconstructed` count and a real `siena_class breakdown
 
 ## Notes & caveats
 
+- **Class depends on `--min-len`.** Since `single`/`multi` is built from
+  *qualifying* sienas, the same domain can change class if you change the length
+  threshold. `n_genes_in_domain` (raw overlap) is always reported so you can see
+  both views.
 - **Domain-level fold-change is a proxy for induction.** A siena/gene is "induced"
   because its domain's aggregate log2FoldChange passed threshold — not because the
   mark was measured over that interval. To strengthen the claim, recount reads
