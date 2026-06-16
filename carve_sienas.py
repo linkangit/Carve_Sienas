@@ -16,17 +16,22 @@ resumes at gene_end+1).
 Each siena inherits its parent domain's statistics (log2FoldChange, FDR, ...),
 so the "stimulus-induced" status of the domain carries through.
 
-Two labels are attached to every siena:
+Two labels are attached to every siena. The single/multi distinction follows the
+GENE CLUSTER (the genes that flank a QUALIFYING siena in the parent domain),
+NOT the raw count of genes overlapping the domain -- so it is consistent with the
+companion genes_from_domains.py.
 
-`domain_class` -- how many genes the PARENT DOMAIN spans:
-    gene_free    parent domain spans 0 genes (fully intergenic domain)
-    single_gene  parent domain spans exactly 1 gene
-    multi_gene   parent domain spans 2+ genes
+`domain_class` -- the flanking-gene cluster size of the PARENT DOMAIN:
+    gene_free    no gene flanks any qualifying siena in the domain
+    single_gene  exactly 1 gene flanks a qualifying siena
+    multi_gene   2+ genes flank qualifying sienas (a gene cluster)
+(The raw overlap count is still reported separately as n_genes_in_domain, and the
+cluster size as n_cluster_genes.)
 
 `siena_class` -- refines that by the siena's PROMOTER SIDE (strand-aware), so you
 can see at a glance which sienas are 5'/promoter intervals and which genic ones
 are left out of --out-promoter-bed:
-    gene_free            no flanking gene (== domain_class gene_free)
+    gene_free            this siena has no flanking gene
     single_gene_5prime   genic flank AND the siena is the 5'/upstream (promoter)
     multi_gene_5prime    interval of >=1 flanking gene: right gene is '+' OR left
                          gene is '-'. These are EXACTLY the sienas that enter
@@ -399,37 +404,59 @@ def main():
     S = pd.DataFrame(rows, columns=cols)
     S["siena_len"] = S.siena_end - S.siena_start + 1
 
-    # domain_class from gene count: 0 -> gene_free, 1 -> single_gene, >=2 -> multi_gene
-    def _dom_class(n):
-        return "gene_free" if n == 0 else ("single_gene" if n == 1 else "multi_gene")
-    S["domain_class"] = S.n_genes_in_domain.map(_dom_class)
-
     # Strand of each flank (gene/locus strand; '.' at a domain edge or if the
     # GTF strand was missing/conflicting).
     S["left_strand"] = S.left_gene.map(lambda g: strand_by_id.get(g, "."))
     S["right_strand"] = S.right_gene.map(lambda g: strand_by_id.get(g, "."))
-
-    # siena_class: refine domain_class by the siena's promoter side.
-    #   *_5prime  = siena is the 5'/upstream (promoter) interval of >=1 flanking
-    #               gene  (right gene '+'  OR  left gene '-')  -> enters
-    #               --out-promoter-bed.
-    #   *_3prime  = genic flank(s) but promoter of none (downstream-only,
-    #               convergent, or strand unresolved) -> left OUT of promoter bed.
-    is_promoter = (S.right_strand == "+") | (S.left_strand == "-")
-    prefix = np.where(S.n_genes_in_domain == 1, "single_gene", "multi_gene")
-    S["siena_class"] = np.where(
-        S.n_genes_in_domain == 0, "gene_free",
-        np.where(is_promoter, prefix + "_5prime", prefix + "_3prime"))
 
     # Inherit parent-domain statistics.
     if carry:
         S = S.merge(dom[["Chrom", "domain_start", "domain_end", *carry]],
                     on=["Chrom", "domain_start", "domain_end"], how="left")
 
-    # Optional length filter.
+    # Length filter FIRST: only qualifying sienas define the flanking-gene
+    # cluster used for single/multi classification (consistent with
+    # genes_from_domains.py). n_genes_in_domain (raw overlap) is retained for
+    # reference but no longer drives the labels.
     n_before = len(S)
     if args.min_len > 0:
         S = S[S.siena_len >= args.min_len].copy()
+
+    # n_cluster_genes = distinct genes flanking a QUALIFYING siena within the
+    # parent domain (the cluster size). All such genes in a domain string into
+    # one cluster -- a sub-threshold siena between them does not split it.
+    if len(S):
+        _lg = S[["Chrom", "domain_start", "domain_end", "left_gene"]].rename(columns={"left_gene": "gene"})
+        _rg = S[["Chrom", "domain_start", "domain_end", "right_gene"]].rename(columns={"right_gene": "gene"})
+        _flank = pd.concat([_lg, _rg], ignore_index=True)
+        _flank = _flank[~_flank.gene.isin(["domain_start", "domain_end"])]
+        _csize = _flank.groupby(["Chrom", "domain_start", "domain_end"]).gene.nunique()
+        S["n_cluster_genes"] = [int(_csize.get((c, a, b), 0))
+                                for c, a, b in zip(S.Chrom, S.domain_start, S.domain_end)]
+    else:
+        S["n_cluster_genes"] = pd.Series(dtype=int)
+
+    # domain_class from CLUSTER size: 0 -> gene_free, 1 -> single_gene,
+    # >=2 -> multi_gene (>=2 genes flank a qualifying siena = a gene cluster).
+    def _dom_class(n):
+        return "gene_free" if n == 0 else ("single_gene" if n == 1 else "multi_gene")
+    S["domain_class"] = S.n_cluster_genes.map(_dom_class)
+
+    # siena_class: gene_free if THIS siena has no gene flank; otherwise the
+    # single/multi prefix from the parent domain's cluster size, refined by the
+    # siena's promoter side.
+    #   *_5prime  = siena is the 5'/upstream (promoter) interval of >=1 flanking
+    #               gene  (right gene '+'  OR  left gene '-')  -> enters
+    #               --out-promoter-bed.
+    #   *_3prime  = genic flank(s) but promoter of none (downstream-only,
+    #               convergent, or strand unresolved) -> left OUT of promoter bed.
+    has_flank = (~S.left_gene.isin(["domain_start", "domain_end"])) | \
+                (~S.right_gene.isin(["domain_start", "domain_end"]))
+    is_promoter = (S.right_strand == "+") | (S.left_strand == "-")
+    prefix = np.where(S.n_cluster_genes == 1, "single_gene", "multi_gene")
+    S["siena_class"] = np.where(
+        ~has_flank, "gene_free",
+        np.where(is_promoter, prefix + "_5prime", prefix + "_3prime"))
 
     # Optional: keep only sienas next to an induced gene body (single/multi gene).
     if args.require_genic_domain:
@@ -441,6 +468,7 @@ def main():
     # Stable IDs after sorting by genomic position.
     S = S.sort_values(["Chrom", "siena_start", "siena_end"]).reset_index(drop=True)
     S.insert(0, "siena_id", [f"siena_{i:05d}" for i in range(1, len(S) + 1)])
+
 
     S.to_csv(args.out_csv, index=False)
 
